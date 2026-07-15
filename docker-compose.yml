@@ -1,0 +1,28 @@
+networks:
+  ansible:
+    external: true
+
+services:
+  pdf:
+    build: .
+    container_name: pdf
+    env_file: .env
+    networks:
+      - ansible
+    volumes:
+      # Lecture-écriture : nécessaire pour "save" (un document reçu par URL peut être
+      # écrit ici si l'utilisateur demande explicitement de le garder — sinon un
+      # document par URL n'est indexé que dans le cache/RAG, 30 jours, jamais sur disque).
+      - /home/francois/pdfs:/pdfs
+      - pdf-data:/data
+      - hf-cache:/root/.cache/huggingface
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pdf-data:
+  hf-cache:
