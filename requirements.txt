@@ -1,5 +1,6 @@
 git+https://github.com/FCare/nexus-client.git@master
 aiohttp>=3.8.0
+httpx>=0.27.0
 openai>=1.0.0
 pymupdf>=1.24.0
 chromadb>=0.5.0

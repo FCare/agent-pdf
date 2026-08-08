@@ -11,6 +11,7 @@ from urllib.parse import unquote, urlparse
 
 import aiohttp
 import fitz  # pymupdf
+import httpx
 import openai
 from nexus_client import NexusClient
 
@@ -21,13 +22,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VK_URL = os.environ["VK_URL"]
 MQTT_HOST = os.environ["MQTT_HOST"]
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-SERVICE_USERNAME = os.environ["MQTT_SERVICE_USERNAME"]
-SERVICE_API_KEY = os.environ["MQTT_SERVICE_API_KEY"]
+# Authentik OAuth (client credentials) — remplace l'ancienne clé API statique
+# MQTT_SERVICE_API_KEY, rejetée par mosquitto-auth-authentik qui exige un vrai JWT
+# Authentik (voir _new_nexus_client ci-dessous, même pattern qu'agent-news/wiki-agent).
+AUTHENTIK_URL = os.environ.get("AUTHENTIK_URL", "https://sso.caronboulme.fr")
+AUTHENTIK_CLIENT_ID = os.environ["AUTHENTIK_CLIENT_ID"]
+AUTHENTIK_CLIENT_SECRET = os.environ["AUTHENTIK_CLIENT_SECRET"]
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://thebrain:8000/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemma-4-12B-it-qat-w4a16-ct")
+
+
+async def _new_nexus_client() -> NexusClient:
+    """Obtient un token OAuth Client Credentials via Authentik et construit un
+    NexusClient authentifié — mosquitto-auth-authentik valide le mot de passe MQTT
+    comme un JWT Authentik, un token frais est donc nécessaire à chaque connexion."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{AUTHENTIK_URL}/application/o/token/",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": AUTHENTIK_CLIENT_ID,
+                "client_secret": AUTHENTIK_CLIENT_SECRET,
+            },
+        )
+        if resp.status_code != 200:
+            logger.error(f"Échec obtention token OAuth: {resp.status_code} {resp.text}")
+            raise RuntimeError("Cannot get OAuth token")
+        access_token = resp.json()["access_token"]
+
+    return await NexusClient.from_authentik_token(
+        AUTHENTIK_URL, MQTT_HOST, access_token,
+        AUTHENTIK_CLIENT_ID, AUTHENTIK_CLIENT_SECRET, MQTT_PORT,
+    )
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 
 CACHE_FILE = os.environ.get("CACHE_FILE", "/data/cache.json")
@@ -498,11 +526,11 @@ async def on_user_connected(topic: str, payload, cache: DocCache):
         return
 
     username = payload.get("username")
-    password = payload.get("password")
+    authenticated = payload.get("authenticated")
     session_id = payload.get("session_id")
     private_topics = payload.get("private_topics", [])
 
-    if not username or not password or not session_id:
+    if not username or not authenticated or not session_id:
         return
 
     agent_topics_topic = None
@@ -519,7 +547,7 @@ async def on_user_connected(topic: str, payload, cache: DocCache):
     request_topic = f"users/{username}/{session_id}/pdf/request"
     result_topic = f"users/{username}/{session_id}/pdf/result"
 
-    nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+    nexus = await _new_nexus_client()
 
     await nexus.publish(
         agent_topics_topic,
@@ -580,25 +608,40 @@ async def on_user_connected(topic: str, payload, cache: DocCache):
 
     async def on_pdf_request(t: str, p):
         if not isinstance(p, dict):
-            return
-
-        query = (p.get("query") or "").strip()
-        if not query:
-            logger.warning(f"[{username}/{session_id}] Requête sans 'query', ignorée: {p}")
+            logger.warning(f"[{username}/{session_id}] Payload PDF non-dict, ignoré: {p!r}")
             await nexus.publish(result_topic, {
-                "report": "Erreur: aucune question fournie.", "sources": [], "saved_as": None,
+                "report": "Erreur: requête mal formée.",
+                "sources": [], "saved_as": None,
+                "error": "malformed request: expected a JSON object",
             })
             return
 
-        document = p.get("document") or None
-        save = bool(p.get("save", False))
-        detail_level = int(p.get("detail_level", 2))
-        if detail_level not in (1, 2, 3):
-            detail_level = 2
+        try:
+            query = (p.get("query") or "").strip()
+            if not query:
+                logger.warning(f"[{username}/{session_id}] Requête sans 'query', ignorée: {p}")
+                await nexus.publish(result_topic, {
+                    "report": "Erreur: aucune question fournie.", "sources": [], "saved_as": None,
+                })
+                return
 
-        logger.info(f"[{username}] Requête pdf: {query!r} document={document!r} save={save}")
+            document = p.get("document") or None
+            save = bool(p.get("save", False))
+            detail_level = int(p.get("detail_level", 2))
+            if detail_level not in (1, 2, 3):
+                detail_level = 2
 
-        report, sources, saved_as = await _handle_pdf_request(query, document, save, detail_level, cache)
+            logger.info(f"[{username}] Requête pdf: {query!r} document={document!r} save={save}")
+
+            report, sources, saved_as = await _handle_pdf_request(query, document, save, detail_level, cache)
+        except Exception as e:
+            logger.error(f"[{username}/{session_id}] Échec traitement requête pdf: {e}")
+            await nexus.publish(result_topic, {
+                "report": "Erreur: une erreur interne est survenue lors du traitement de la requête.",
+                "sources": [], "saved_as": None,
+                "error": f"internal error while handling request: {e}",
+            })
+            return
 
         await nexus.publish(result_topic, {"report": report, "sources": sources, "saved_as": saved_as})
         logger.info(f"[{username}/{session_id}] Réponse publiée sur {result_topic}")
@@ -614,7 +657,7 @@ async def main():
     asyncio.create_task(folder_scan_loop(cache))
     asyncio.create_task(counter_decrement_loop(cache))
 
-    nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+    nexus = await _new_nexus_client()
 
     async def _on_user_connected(t: str, p):
         await on_user_connected(t, p, cache)
