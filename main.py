@@ -573,6 +573,7 @@ async def on_user_connected(topic: str, payload, cache: DocCache):
                     ),
                     "access": "write",
                     "response_topic": result_topic,
+                    "slow": True,  # réponse en plusieurs secondes : phrase d'attente
                     "format": {
                         "query": "Que dit ce document sur ...",
                         "document": "facture_edf.pdf",
